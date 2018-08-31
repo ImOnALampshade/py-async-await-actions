@@ -1,27 +1,71 @@
 # Leveraging async/await for game logic
 
-I've been experimenting with using async/await to write game logic code in Python. Because I've only used Python to do this, this entire post will be using Python for example code and implementation details. This code could also be adapted to run in JavaScript, and probably even in C# if you're adventurous.
+I've been experimenting with using async/await to write game logic code in Python. Because I've only used Python to do this, this entire post will be using Python for example code and implementation details. This code could also be adapted to run in JavaScript, and probably even in C# if you're extremely adventurous.
 
-# Actions lists: what they solve, and the problems they have
+# Goals
 
-Consider this Python script, in the context of a game:
+The goal of this post is to show you how to take messy game logic code, like this:
 
 ```python
 def script(self):
-  self.move_forward(3)
-  self.turn(90)
-  self.move_forward(3)
+  for i in range(0, 5):
+    cb_act = callback_action(lambda: self.bomb.message = f'{5 - i}...')
+    self.action_list.add_action(cb_act)
+
+    beep_act = callback_action(self.bomb.beep)
+    self.action_list.add_action(beep_act)
+
+    wait_act = wait_action(1)
+    self.action_list.add_action(wait_act)
+
+    def defused_callback():
+      if self.bomb.defused:
+        self.action_list.clear()
+    defused_act = callback_action(defused_callback)
+    self.action_list.add_action(defused_act)
+
+  exp_act = callback_action(self.bomb.explode)
+  self.action_list.add_action(exp_act)
 ```
 
-Our intention here is for our character to move forward 3 spaces, turn 90 degrees, then move forward 3 spaces in the new direction they are facing. However, how does this function work? We know that this script must be called from somewhere within the update loop of the game, and we also know that the character moving forward must take place over multiple frames, so that we can play some fancy animations and all that while the player moves forward.
+And turn it into something more high level, cleaner, and more flexible, like this:
 
-Say it takes 1 second to move forward 3 spaces, and 0.5 seconds to turn 90 degrees. This means that in order to execute this entire script, we need 2.5 seconds (Which is 150 frames at 60 FPS). So, how can we use this script inside the update of 1 frame, when it takes 150 frames to finish the script?
+```python
+async def script(self):
+  for i in range(0, 5):
+    self.bomb.message = f'{i}...'
+    self.bomb.beep()
+    await self.wait(1)
+
+    if self.bomb.defused:
+      return None
+
+  self.bomb.explode()
+```
+
+# Actions lists: what they solve, and the problems they have
+
+First, let's look at how to make an in-game timer for a bomb, with a small LCD timer on it which will count down from 5, and then explode. Let's take a look at our script:
+
+
+```python
+def script(self):
+  for i in range(0, 5):
+    self.bomb.message = f'{5 - i}...'
+    self.wait(1)
+
+  self.bomb.explode()
+```
+
+This is a pretty straight forward script - however, it's not as simple as the script just running over those 5 seconds. This entire script runs within the update loop for one frame (The frame when the countdown timer was triggered), and we have to do other things in the game, like rendering, responding to player input, and sending hoards of enemies after the player.
+
+Since each frame runs in 1/60th of a second, how can we have this script perform actions over multiple frames when it runs entirely inside of one frame?
 
 ## Enter: Actions
 
-An "action" is something we can use in our games to run logic over multiple frames, which can have some logic toward how they run.
+An "action" is something we can use in our games to run logic over multiple frames, which can have some logic toward how they run. We add these actions to a queue - an action list - which will iterate through these actions, running one at a time.
 
-Let's take a look at a simple action:
+Let's take a look at our base action class:
 
 ```python
 class action:
@@ -29,6 +73,7 @@ class action:
   def update(self, dt): pass
   def end(self): pass
   def is_over(self): return True
+  def result(self): return None
 ```
 
 Our action has 4 methods, which are pretty straightforward:
@@ -37,204 +82,331 @@ Our action has 4 methods, which are pretty straightforward:
 * `update`: Called every frame the action is running for
 * `end`: Called when the action has ended
 * `is_over`: Called every frame to check if the action is over
+* `result`: Gets the result of the action, for when an action is doing some other work in the background we want to get back.
 
-Let's take a look at a couple of action implementations, so we can understand how these work:
+Actions are placed into a queue, called an action list. When you add an action to the list, it gets placed at the end of the queue. As the game updates, we grab the first action in the queue, and update it. When it ends, we pop the front of the queue, and move onto the next action. You can see the implementation in the code files.
+
+We can define actions to do whatever we want in the game - and their logic can span multiple frames, so we can have our bomb countdown script made using these actions. Let's create two actions, which we'll use for our bomb. `wait_action` and `callback_action`.
+
+`wait_action` will wait some number of seconds, and then finish. This will block the action list from continuing for as long as we want.
 
 ```python
 class wait_action(action):
   """
-    An action that just blocks for some period of time
+    An action that will do nothing, and block the action list, until a timer is
+    completed
   """
   def __init__(self, time):
-    self.time = time
-
-  def update(self, dt):
-    self.time -= dt
-
-  def is_over(self):
-    return self.time <= 0
-
-class animation_action(action):
-  """
-    An action that starts playing an animation, and blocks until it finishes
-  """
-  def __init__(self, animationComponent, animationName):
-    self.animationComponent = animationComponent
-    self.animationName = animationName
+    self.current_time, self.end_time = 0, end_time
 
   def start(self):
-    self.animationComponent.set_animation(self.animationName)
+    # We re-set current_time to 0 here in case this action object is being
+    # re-used
+    self.current_time = 0
+
+  def update(self, dt):
+    # Update the current time
+    self.current_time += dt
 
   def is_over(self):
-    self.animationComponent.has_animation_ended()
+    # We're done when our current time has gone past the end time
+    return self.current_time >= self.end_time
 ```
 
-We can define actions to do whatever we want in the game - and their logic can span multiple frames, so we can have our script like we had above!
-
-With our new actions, let's look at what the `move_forward` and `turn` actions look like:
+`callback_action` will immediately call it's callback function, and the end right away. By using closures in Python, we can use this to inject any function call we want into an action list.
 
 ```python
-def move_forward(self, spaces, actionList=self):
-  act = walk_action(spaces)
-  actionList.add_action(act)
+class callback_action(action):
+  """
+    An action that will simply call a function and end immediately
+  """
+  def __init__(self, callback):
+    """
+      Initializes a new callback action
 
-def turn(self, degrees, actionList=self):
-  act = turn_action(degrees)
-  actionList.add_action(act)
+      callback:
+        The callback we want to call when this action starts
+    """
+    self.callback = callback
+
+  def start(self):
+    # Just call our callback
+    self.callback()
+
+  def is_over(self):
+    # We end immediately, because we only need to run the start method
+    return True
 ```
 
-So we can see that we are appending an action to an action list when these functions are called - which makes our script work without having to be run across multiple frames. Our script just queues up multiple things for our character to do, and the action list will iterate through this list until it runs out of actions.
+With our new actions, let's update our script to work within our main game loop:
 
-However, there are still some big issues with this code that make it difficult to use.
+```python
+def script(self):
+  for i in range(0, 5):
+    cb_act = callback_action(lambda: self.bomb.message = f'{5 - i}...')
+    self.action_list.add_action(cb_act)
+
+    wait_act = wait_action(1)
+    self.action_list.add_action(wait_act)
+
+  exp_act = callback_action(self.bomb.explode)
+  self.action_list.add_action(exp_act)
+```
+
+So now that we are appending an action to an action list when these functions are called, our script works without having to be run across multiple frames. Our script just queues up multiple things for our bomb to do, and the action list will iterate through this list until it runs out of actions.
+
+While this solves our problems with the bomb, it isn't the best system we can use.
 
 ## Issue 1 - Loops
 
-Consider what would happen if we were to do the following, in order to continually repeat the script we have written to make the character walk around in a circle (Or, I guess a square):
+Consider what would happen if instead of our bomb counting down from 5, we started it at a much higher number - say, 5 minutes (or 300 seconds). In our script, this is an easy change:
+
+```python
+def script(self):
+  for i in range(0, 300):
+    cb_act = callback_action(lambda: self.bomb.message = f'{300 - i}...')
+    self.action_list.add_action(cb_act)
+
+    wait_act = wait_action(1)
+    self.action_list.add_action(wait_act)
+
+  exp_act = callback_action(self.bomb.explode)
+  self.action_list.add_action(exp_act)
+```
+
+However, there's a couple problems here:
+
+* We are creating 601 actions - 300 set_text actions, 300 wait_actions, and 1 explode action - in a single frame. Python's memory allocator will not be very happy here.
+* We are using a lot of memory, for something very simple.
+
+To make matters worse, let's say we are creating a script for a flickering light - at some random time between 10 and 20 seconds, a light will turn off for 0.25 seconds, and then turn back on. How would we implement that? We may naively try to do this right off the bat (assuming that all our methods will simply add an action to the action list):
 
 ```python
 def script(self):
   while True:
-    self.move_forward(3)
-    self.turn(90)
+    time = random.uniform(10, 20)
+
+    wait1 = wait_act(time)
+    self.action_list.add_action(wait1)
+
+    light_off = callback_action(self.light_off)
+    self.action_list.add_action(light_off)
+
+    wait2 = wait_act(0.25)
+    self.action_list.add_action(wait2)
+
+    light_on = callback_action(self.light_on)
+    self.action_list.add_action(light_on)
 ```
 
-Using `while True` makes this function repeat forever, and keep adding more actions - which is our intention. However, this script is still running inside the main game loop - and the main game loop will never resume after this. This function will just loop infinitely, appending more and more action objects to the end of a list, eating up all the memory while the game is hard locked.
-
-There's a few solutions to this. Let's create a new type, `loop_action`, in order to create a loop for actions to repeat (Implementation of this action is left as an exercise to the reader).
-
-Now, we can use a `loop_action` to create our loop:
-
-```python
-def script(self):
-  loop = loop_action(condition=lambda True)
-
-  # Now we pass the loop into move_forward and turn, so that the actions are
-  # added to that action list instead of our object's action list
-  self.move_forward(3, loop)
-  self.turn(90, loop)
-
-  # Add the action to our action list
-  self.add_action(loop)
-```
-
-So, while we can still create loops - they aren't as easy, and don't fit into our typical experience of programming. We can't just create a `for` or `while` loop like we may typically want to, but instead, we must use a new action type to stand in for these.
-
-We also have the issue that all our actions must be re-runnable in order to be added to a loop - that is, after the action ends, if it is started again, it must be able to reproduce the same effects it had before. This is something we will have to keep in mind when writing all our actions going forward! (Note that the `wait_action` defined above would not work under this system)
+However, the issue here is clear: Once our script starts, it will never end. We will be stuck in an infinite loop, adding more and more actions to the list until our computer can't take it anymore, and we run out of memory for our action list.
 
 ## Issue 2 - Non-actions
 
-Let's say we create a new function which does **not** use an action in the background, called `take_damage`:
+Our bomb has a big issue - it doesn't beep. Because bombs should beep (for dramatic effect), we now need to add in some beeps.
 
-```python
-def take_damage(self, amount):
-  self.health -= amount
-```
-
-Now, let's modify our original script to make the character take 30 damage when they finish the script:
+So now, we update our script to:
 
 ```python
 def script(self):
-  self.move_forward(3)
-  self.turn(90)
-  self.move_forward(3)
+  for i in range(0, 5):
+    cb_act = callback_action(lambda: self.bomb.message = f'{5 - i}...')
+    self.action_list.add_action(cb_act)
 
-  self.take_damage(30)
+    # Beep here, after updating the message!
+    self.bomb.beep()
+
+    wait_act = wait_action(1)
+    self.action_list.add_action(wait_act)
+
+  exp_act = callback_action(self.bomb.explode)
+  self.action_list.add_action(exp_act)
 ```
 
-So, when does the character take damage? Our intention here is for the character to take damage after moving, turning, and moving again - however, because `take_damage` applied immediately, and `move_forard` and `turn` queue up actions to be performed later, `take_damage` will be applied immediately when `script` is called.
-
-We can also solve this, by creating a new action, which we will call `callback_action`. Now we can use this action to call `take_damage` as part of the action list:
+We go to run the script, and instead of beeps after every second, we hear 5 overlapping beeps followed by the timer starting. Can you tell why? Our beep method isn't called by a callback action - which means that when the script runs, and is queuing up all the actions, it will beep in the middle of it's queue. Let's fix this:
 
 ```python
 def script(self):
-  self.moveForward(3)
-  self.turn(90)
-  self.moveForward(3)
+  for i in range(0, 5):
+    cb_act = callback_action(lambda: self.bomb.message = f'{5 - i}...')
+    self.action_list.add_action(cb_act)
 
-  dmg_act = callback_action(lambda: self.take_damage(30))
-  self.add_action(dmg_act)
+    beep_act = callback_action(self.bomb.beep)
+    self.action_list.add_action(beep_act)
+
+    wait_act = wait_action(1)
+    self.action_list.add_action(wait_act)
+
+  exp_act = callback_action(self.bomb.explode)
+  self.action_list.add_action(exp_act)
 ```
 
-This works - but it might leave an uninformed reader confused as to why we only use `callback_action` for `take_damage`, and not `move_forward` or `turn`. Which becomes doubly confusing when you realize that `move_forward` and `turn` would probably still work when wrapped in a `callback_action`!
+
+While this mistake is entirely avoidable, it does make these scripts more difficult to write - you constantly have to be adding callback actions to do simple things, because otherwise, things will not happen when you intend them to.
 
 ## Issue 3 - Responding to changes between actions
 
-Now that our character is taking damage, they probably want to heal if their health is low. But how do we let them make that decision? Typically, we could use in `if` statement to accomplish this easily, but that won't work with our script. Consider this:
+What if our bomb is defused before the timer hits 0?
+
+A naive approach would look something like this:
 
 ```python
 def script(self):
-  self.moveForward(3)
-  self.turn(90)
-  self.moveForward(3)
-  self.callbackAction(lambda: self.takeDamage(30))
-  if self.health < 50:
-    self.heal()
+  for i in range(0, 5):
+    cb_act = callback_action(lambda: self.bomb.message = f'{5 - i}...')
+    self.action_list.add_action(cb_act)
+
+    beep_act = callback_action(self.bomb.beep)
+    self.action_list.add_action(beep_act)
+
+    wait_act = wait_action(1)
+    self.action_list.add_action(wait_act)
+
+    if self.bomb.defused:
+      return None
+
+  exp_act = callback_action(self.bomb.explode)
+  self.action_list.add_action(exp_act)
 ```
 
-This is essentially the same problem as earlier: We have to call heal as part of the action list. But that's fine, we can define a new `conditional_action` that will only call an action if a condition is met:
+However, this won't work, because of the same issue we had with the beeping earlier. Because the defused flag will (probably) start as `False`, and our script does not run across all the frames the bomb is ticking down during, we will only check the defused flag once (Well, 5 times back-to-back) - the frame that the script runs.
+
+Instead, we need to use callback action again, to do this:
 
 ```python
 def script(self):
-  self.moveForward(3)
-  self.turn(90)
-  self.moveForward(3)
+  for i in range(0, 5):
+    cb_act = callback_action(lambda: self.bomb.message = f'{5 - i}...')
+    self.action_list.add_action(cb_act)
 
-  dmg_act = callback_action(lambda: self.take_damage(30))
-  self.add_action(dmg_act)
+    beep_act = callback_action(self.bomb.beep)
+    self.action_list.add_action(beep_act)
 
-  heal_act = conditional_action(
-    (lambda: self.health < 50),
-    callback_action(lambda: self.heal())
-  )
-  self.add_action(heal_act)
+    wait_act = wait_action(1)
+    self.action_list.add_action(wait_act)
+
+    def defused_callback():
+      if self.bomb.defused:
+        self.action_list.clear()
+    defused_act = callback_action(defused_callback)
+    self.action_list.add_action(defused_act)
+
+  exp_act = callback_action(self.bomb.explode)
+  self.action_list.add_action(exp_act)
 ```
 
-So now we can use `conditional_action` in place of all our if statements. We can expand this action to allow us to build complicated if/else structures in our actions if we want to, as well.
+This still isn't a perfect solution - because we just nuke our action list when the bomb is defused, any non-related actions in the queue for the bomb will never get run. And, of course, it's just as annoying as when we had to deal with the beeping.
 
 ## What is wrong with all of these?
 
-So what have we done with these actions? Let's apply all of our scripts together into one:
+Well, not all that much is wrong here. We have to rely pretty heavily on callback_action to do a lot of what we'd want to do here, but we can make it work.
+
+The problem is that is isn't that simple. Let's look at this code, which would not at all work given our current implementation, but is remarkably simple:
 
 ```python
 def script(self):
-  loop = loop_action(condition=lambda: True)
-  self.move_forward(3, loop)
-  self.turn(90, loop)
+  for i in range(0, 5):
+    self.bomb.message = f'{i}...'
+    self.bomb.beep()
+    self.wait(1)
 
-  dmg_act = callback_action(lambda: self.take_damage(30))
-  loop.add_action(dmg_act)
+    if self.bomb.defused:
+      return None
 
-  heal_act = conditional_action(
-    (lambda: self.health < 50),
-    callback_action(lambda: self.heal())
-  )
-  loop.add_action(heal_act)
-
-  self.add_action(loop)
+  self.bomb.explode()
 ```
 
-While this code will work for our purposes, it isn't very easy to understand right off the bat. It doesn't mesh very well with the code we typically write.
-
-Let's take a step back - and let's look at what this could would look like if we wrote it in a more "typical" way:
+Now let's look at our finished code:
 
 ```python
 def script(self):
-  while True:
-    self.moveForward(3)
-    self.turn(90)
+  for i in range(0, 5):
+    cb_act = callback_action(lambda: self.bomb.message = f'{5 - i}...')
+    self.action_list.add_action(cb_act)
 
-    self.takeDamage(30)
+    beep_act = callback_action(self.bomb.beep)
+    self.action_list.add_action(beep_act)
 
-    if self.health < 50:
-      self.heal()
+    wait_act = wait_action(1)
+    self.action_list.add_action(wait_act)
+
+    def defused_callback():
+      if self.bomb.defused:
+        self.action_list.clear()
+    defused_act = callback_action(defused_callback)
+    self.action_list.add_action(defused_act)
+
+  exp_act = callback_action(self.bomb.explode)
+  self.action_list.add_action(exp_act)
 ```
 
-Basically, all we've done by defining all these actions is just created our own embedded programming language (Complete with while loops, if statements, and function calls) using action lists! We've taken our already Turing complete language of Python, and we're trying to create some new Turing complete data structure inside of it.
-
-Why, though? We haven't made it easier to program - in fact, just the opposite! Our goal is to approach something like the turtle code we looked at when we started, using while loops and if statements just like we do in the rest of the language.
+It's easy to tell which one is more intuitive, cleaner, and easier to write. However, how would we be able to write code like the first example?
 
 # Enter: Async/await
 
-Typically, async/await is used to create non-blocking IO for things like network access and disk reads/writes. The idea behind it is that while you are waiting to get data back from a server, or waiting for a file read operation to finish, you can still continue doing useful work. This is particularly useful for things like webservers - where you need to respond to hundreds of requests per second while waiting for things like file read operations, remote database access, etc. You still want to be able to respond to other requests while you are running a database query to respond to another request.
+**NOTE: I'm glossing over this topic quite a bit to get you understand the internals of async code, in order to implement your own asynchronous event loop. There is a lot of hand waving for the sake of brevity. Please do not take this as gospel.**
 
-However, many high level languages - Like Python, and JavaScript - support async/await in such a generic way that we can actually leverage it to do whatever we want!
+Typically, async/await is used to create non-blocking IO for things like network access and disk reads/writes. The idea behind it is that while you are waiting to get data back from a server, or waiting for a file read operation to finish, you can still continue doing useful work. This is particularly useful for things like webservers - where you need to respond to hundreds of requests per second while waiting for things like file read operations, remote database access, etc. You still want to be able to respond to other requests while you are running a database query to respond to another request, so you can use async to "suspend" the first request until you finish with your work, and continue responding to other request in the meantime.
+
+The traditional approach to this has been multi-threading, but that adds a lot of complexity which, it turns out, is not necessary. With asynchronous code, we can easily do this all from one thread! Using async and await is one approach to doing this, but it is the easiest and what you are most likely to encounter going forward.
+
+## What async isn't
+
+Async is not multi-threading. In fact, most of the time, asynchronous code refers to code that runs in only one thread.
+
+## asyncio
+
+The typical way that we use async in Python to do disk and network IO is through the `asyncio` module. Here is an example where we can read a file and print its contents (Because python does not support async file IO out of the box, this example requires `aiofiles` on your machine, [see the repo](https://github.com/Tinche/aiofiles) for installation instructions):
+
+```python
+import aiofiles
+import asyncio
+
+async def print_file(f):
+  contents = await f.read()
+  print(contents)
+
+async def main():
+  async with aiofiles.open('example.txt', 'rt') as f:
+    await print_file(f)
+
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
+loop.close()
+```
+
+So how does this work?
+
+Let's start with these 3 lines:
+
+```python
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
+loop.close()
+```
+
+Our `print_file` and `main` functions are relatively straightforward - the only weirdness they have compared to "normal" python is a sprinkling of the `async` and `await` keywords.
+
+Our declarations for `print_file` and `main` start with `async` - this is so that Python knows that these functions run asynchronously, which allows us to use `await` inside of them. We'll talk more about this later.
+
+`await` is the secret sauce in all of this. In our `print_file` function, we could do what we typically do in python by just calling `read` like normal:
+
+```python
+contents = f.read()
+print(contents)
+```
+
+However, as we all know, hard drive access is a very slow operation. Reading the entire contents of our file into memory is going to take at least a few milliseconds - precious clock cycles that could be spent bitcoin mining. So, we could just do something else while we wait for it to finish - and this is where `await` comes in.
+
+In `aiofiles`, `f.read()` doesn't return a string with the file contents. Instead, it returns a promise - a promise that says that "in the future, this be available." When we say `await f.read()`, we are adding that promise to the event loop, and then letting that file read finish while we do more work. You can await any promise, and get the resulting value from that promise, by using `await [promise]`, where `promise` is typically a function call.
+
+Because our `print_file` function is marked as `async`, it will return a promise - which means that, in order to actually run this function, it must be `await`ed. However, you can only `await` from an `async` function. Because `main` is also `async`, it can await `print_file`.
+
+However, code written at the global level in python is not `async`. So, how can we await `main`? We have to use an event loop object from `asyncio`. I won't go into much detail about this, because we aren't to concerned with how `asyncio` works for the purposes of this post.
+
+## Without asyncio
+
+`asyncio` is a great module, and one that I highly recommend learning if you've got Python on your resume. However, we aren't interested in using `async` for file or network IO - we want to use it for game logic. So, let's look at how our
+
+
